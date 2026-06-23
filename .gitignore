@@ -1,0 +1,21 @@
+# ROS 2 build, install, and log directories
+build/
+install/
+log/
+
+# Python cache and output
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Machine learning model weights (large files)
+*.pt
+assets/*.pt
+assets/**/*.pt
+
+# OS files
+.DS_Store
+Thumbs.db
