@@ -1,0 +1,132 @@
+================================================================================
+          PROJECT CONTEXT HANDOVER: ADVERSE WEATHER PERCEPTION PIPELINE
+================================================================================
+Project: TH OWL Adverse Weather Perception pipeline (Project 8)
+Target System: live CARLA simulator machine
+
+This document is self-contained and ready to be pasted directly into the AI agent
+on the secondary machine.
+
+--------------------------------------------------------------------------------
+1. CODEBASE FILE TREE & AUDIT CHECKLIST
+--------------------------------------------------------------------------------
+To migrate the package, copy ONLY the following files/folders:
+
+ros2_ws/
+├── assets/
+│   └── pt_files/
+│       ├── gating.py               <-- Custom Day/Night gating logic (you must upload)
+│       ├── classifier.pt           <-- ResNet50 Classifier Weights (you must upload)
+│       ├── restorer.pt             <-- LightweightRestorer Weights (you must upload)
+│       └── yolo.pt                 <-- YOLOv10-S Weights (you must upload)
+└── src/
+    └── yolo_perception_pkg/
+        ├── package.xml             <-- Package dependencies
+        ├── setup.py                <-- Entry points configuration
+        ├── setup.cfg               <-- Config
+        ├── launch/
+        │   └── perception_pipeline.launch.py  <-- ROS2 Launch Script
+        └── yolo_perception_pkg/
+            ├── __init__.py
+            ├── perception_carla_node.py        <-- Perception Node (CARLA)
+            ├── perception_offline_node.py      <-- Offline Testing Node
+            └── yolo_detector_node.py          <-- YOLO Detector Node
+
+CRITICAL WARNING: DO NOT copy the following build artifacts under any circumstances:
+- /home/dell_ubuntu/ros2_ws/build/
+- /home/dell_ubuntu/ros2_ws/install/
+- /home/dell_ubuntu/ros2_ws/log/
+
+--------------------------------------------------------------------------------
+2. PIPELINE SYSTEM & DATA FLOW BLUEPRINT
+--------------------------------------------------------------------------------
+The architecture splits perception and detection into two decoupled stages:
+
+[CARLA Simulator / Image Topic]
+       │
+       ▼ (/carla/ego_vehicle/rgb_front/image)
+[perception_carla_node.py] ◄───► [assets/pt_files/gating.py] (Illumination Gating)
+       │
+       ├─► (Restored Option) ──► [LightweightRestorer] ──┐
+       │                                                 ├─► [Clamp [0.0, 1.0]]
+       └─► (Bypass Option)   ────────────────────────────┘
+       │
+       ▼ (/camera/front/cleaned) (Preserves original simulation timestamp header)
+[yolo_detector_node.py]  ◄───► [ultralytics.YOLO] (yolo.pt inference on GPU)
+       │
+       ▼ (/yolo/detections)
+[vision_msgs.msg.Detection2DArray] ──► Downstream Planners / Control
+
+ROS2 Topics & Message Specifications:
+* Input: `/carla/ego_vehicle/rgb_front/image` [sensor_msgs/msg/Image]
+* Mid-Stream: `/camera/front/cleaned` [sensor_msgs/msg/Image] (Copies incoming message header)
+* Detections: `/yolo/detections` [vision_msgs/msg/Detection2DArray] (Copies incoming message header)
+
+--------------------------------------------------------------------------------
+3. DETAILED COMPONENT ARCHITECTURES (NO FALLBACKS)
+--------------------------------------------------------------------------------
+3.1. LightweightRestorer Network Structure:
+A custom PyTorch residual reconstruction network defined as:
+  Input (Channels=3) -> Conv2d(3, 64, kernel_size=3, padding=1) -> ReLU -> Conv2d(64, 3, kernel_size=3, padding=1)
+  Forward pass logic implements a skip connection adding the output to the input tensor:
+  Output = x + Conv2(ReLU(Conv1(x)))
+
+3.2. ResNet50 Classifier Adaptability:
+The classifier fc (fully connected) layer dynamically reshapes to match the loaded checkpoint dimensions:
+  - If fc.1.weight exists: configured as nn.Sequential(nn.Dropout(p=0.2), nn.Linear(2048, num_classes))
+  - If fc.weight exists: configured as nn.Linear(in_features, num_classes)
+
+3.3. YOLO Detector:
+Utilizes YOLOv10-S / YOLOv8 via the `ultralytics` package.
+Extracts bounding box coordinates [xmin, ymin, xmax, ymax], integer class ID, and confidence score.
+Filters out detections with confidence <= 0.5.
+
+3.4. Direct Model Loading & Gating Import:
+All models and files are loaded directly without path fallbacks. The system will fail fast if files are missing:
+* Gating: Imported directly as a module via `import gating` after appending `/home/dell_ubuntu/ros2_ws/assets/pt_files` to `sys.path`.
+* Weight files are loaded directly via PyTorch (`torch.load`) and YOLO (`YOLO(weights_path)`) using the paths:
+  - `/home/dell_ubuntu/ros2_ws/assets/pt_files/classifier.pt`
+  - `/home/dell_ubuntu/ros2_ws/assets/pt_files/restorer.pt`
+  - `/home/dell_ubuntu/ros2_ws/assets/pt_files/yolo.pt`
+
+--------------------------------------------------------------------------------
+4. GATING SWITCH INTERFACE SPECIFICATION
+--------------------------------------------------------------------------------
+The custom gating logic is contained entirely inside your uploaded `gating.py`
+file. The node assumes the script defines a function with the following signature:
+
+def check_gating(mean_brightness: float, laplacian_var: float, white_clipping: float) -> (bool, str):
+    """
+    Evaluates calculated image metrics and decides if the frame is degraded.
+    Returns:
+        route_to_restorer (bool): True if the frame should be restored, False to bypass.
+        route_reason (str): Reason code for logging output (e.g. glare, weather, bypass).
+    """
+    ...
+
+--------------------------------------------------------------------------------
+5. SECOND MACHINE SETUP & INSTALLATION COMMANDS
+--------------------------------------------------------------------------------
+Step 1: Install ROS2 Humble package dependencies:
+```bash
+sudo apt update
+sudo apt install -y ros-humble-cv-bridge ros-humble-vision-msgs ros-humble-sensor-msgs ros-humble-std-msgs
+```
+
+Step 2: Install PyTorch and Python package dependencies:
+```bash
+pip3 install torch torchvision opencv-python numpy ultralytics
+```
+
+Step 3: Compile the Workspace:
+From the workspace root directory (~/ros2_ws/):
+```bash
+colcon build --symlink-install --packages-select yolo_perception_pkg
+source install/setup.bash
+```
+
+Step 4: Launch the Pipeline:
+```bash
+ros2 launch yolo_perception_pkg perception_pipeline.launch.py
+```
+================================================================================

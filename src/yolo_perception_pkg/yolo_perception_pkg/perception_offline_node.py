@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 
 import os
+import sys
 import time
 import numpy as np
 import cv2
 import torch
 import torch.nn as nn
 import torchvision.models as models
+
+# Append the directory containing gating.py so it can be imported directly
+sys.path.append('/home/dell_ubuntu/ros2_ws/assets/pt_files')
+import gating
 
 import rclpy
 from rclpy.node import Node
@@ -29,14 +34,16 @@ class PerceptionOfflineNode(Node):
         
         # Declare ROS2 Parameters for file paths
         self.declare_parameter('video_path', '/home/dell_ubuntu/ros2_ws/assets/sample_driving_test.mp4')
-        self.declare_parameter('restorer_weights_path', '/home/dell_ubuntu/ros2_ws/assets/fully_unified_all_weather_restorer.pt')
-        self.declare_parameter('classifier_weights_path', '/home/dell_ubuntu/ros2_ws/assets/weather_classifier_resnet50.pt')
+        self.declare_parameter('restorer_weights_path', '/home/dell_ubuntu/ros2_ws/assets/pt_files/restorer.pt')
+        self.declare_parameter('classifier_weights_path', '/home/dell_ubuntu/ros2_ws/assets/pt_files/classifier.pt')
         
         # Get parameter values
         self.video_path = self.get_parameter('video_path').get_parameter_value().string_value
         self.restorer_weights_path = self.get_parameter('restorer_weights_path').get_parameter_value().string_value
         self.classifier_weights_path = self.get_parameter('classifier_weights_path').get_parameter_value().string_value
         
+
+
         # Device selection (CUDA with CPU fallback)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.get_logger().info(f"Using device: {self.device}")
@@ -80,64 +87,44 @@ class PerceptionOfflineNode(Node):
     def _init_models(self):
         # 1. Initialize custom denoiser
         self.restorer = LightweightRestorer().to(self.device)
-        if os.path.exists(self.restorer_weights_path):
-            try:
-                checkpoint = torch.load(self.restorer_weights_path, map_location=self.device)
-                if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
-                    restorer_state = checkpoint['model_state']
-                else:
-                    restorer_state = checkpoint
-                self.restorer.load_state_dict(restorer_state)
-                self.get_logger().info(f"Successfully loaded restorer weights from {self.restorer_weights_path}")
-            except Exception as e:
-                self.get_logger().error(f"Error loading restorer weights: {str(e)}")
+        checkpoint = torch.load(self.restorer_weights_path, map_location=self.device)
+        if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
+            restorer_state = checkpoint['model_state']
         else:
-            self.get_logger().warn(f"Restorer weights path not found: {self.restorer_weights_path}. Running with uninitialized weights.")
+            restorer_state = checkpoint
+        self.restorer.load_state_dict(restorer_state)
+        self.get_logger().info(f"Successfully loaded restorer weights from {self.restorer_weights_path}")
         
         # 2. Initialize classifier
         self.classifier_name = "resnet50"
-        self.classifier = None
-        
-        if os.path.exists(self.classifier_weights_path):
-            try:
-                checkpoint = torch.load(self.classifier_weights_path, map_location=self.device)
-                if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
-                    classifier_state = checkpoint['model_state']
-                else:
-                    classifier_state = checkpoint
-                
-                # Determine architecture from checkpoint keys
-                keys = list(classifier_state.keys())
-                is_efficientnet = any('classifier.1' in k for k in keys) or 'efficientnet' in self.classifier_weights_path.lower()
-                
-                if is_efficientnet:
-                    self.classifier_name = "efficientnet_b0"
-                    self.classifier = models.efficientnet_b0()
-                    # Check if classifier.1.weight is present in state dict to find class count
-                    if 'classifier.1.weight' in classifier_state:
-                        num_classes = classifier_state['classifier.1.weight'].size(0)
-                        if num_classes != 1000:
-                            self.classifier.classifier[1] = nn.Linear(self.classifier.classifier[1].in_features, num_classes)
-                            self.get_logger().info(f"Adjusted EfficientNet classifier layer to output {num_classes} classes.")
-                else:
-                    self.classifier_name = "resnet50"
-                    self.classifier = models.resnet50()
-                    if 'fc.weight' in classifier_state:
-                        num_classes = classifier_state['fc.weight'].size(0)
-                        if num_classes != 1000:
-                            self.classifier.fc = nn.Linear(self.classifier.fc.in_features, num_classes)
-                            self.get_logger().info(f"Adjusted ResNet50 fc layer to output {num_classes} classes.")
-                
-                self.classifier.load_state_dict(classifier_state)
-                self.get_logger().info(f"Successfully loaded {self.classifier_name} classifier weights from {self.classifier_weights_path}")
-            except Exception as e:
-                self.get_logger().error(f"Error loading classifier weights: {str(e)}")
-                # Fallback
-                self.classifier = models.resnet50()
+        self.classifier = models.resnet50()
+        checkpoint = torch.load(self.classifier_weights_path, map_location=self.device)
+        if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
+            classifier_state = checkpoint['model_state']
         else:
-            self.get_logger().warn(f"Classifier weights path not found: {self.classifier_weights_path}. Running with default ResNet50.")
+            classifier_state = checkpoint
+        
+        # Determine architecture from checkpoint keys
+        keys = list(classifier_state.keys())
+        is_efficientnet = any('classifier.1' in k for k in keys) or 'efficientnet' in self.classifier_weights_path.lower()
+        
+        if is_efficientnet:
+            self.classifier_name = "efficientnet_b0"
+            self.classifier = models.efficientnet_b0()
+            if 'classifier.1.weight' in classifier_state:
+                num_classes = classifier_state['classifier.1.weight'].size(0)
+                if num_classes != 1000:
+                    self.classifier.classifier[1] = nn.Linear(self.classifier.classifier[1].in_features, num_classes)
+        else:
+            self.classifier_name = "resnet50"
             self.classifier = models.resnet50()
-            
+            if 'fc.weight' in classifier_state:
+                num_classes = classifier_state['fc.weight'].size(0)
+                if num_classes != 1000:
+                    self.classifier.fc = nn.Linear(self.classifier.fc.in_features, num_classes)
+        
+        self.classifier.load_state_dict(classifier_state)
+        self.get_logger().info(f"Successfully loaded {self.classifier_name} classifier weights from {self.classifier_weights_path}")
         self.classifier = self.classifier.to(self.device)
         
         # Set models to evaluation mode
@@ -180,25 +167,8 @@ class PerceptionOfflineNode(Node):
             white_clipping = float(white_clipped_pixels) / float(total_pixels)
             
             # 3. Illumination & Gating Switching Logic
-            route_to_restorer = False
-            route_reason = "Bypass"
-            
-            if mean_brightness < 75.0:
-                # Night Mode
-                if white_clipping > 0.03:
-                    route_to_restorer = True
-                    route_reason = "NIGHT_GLARE"
-                elif laplacian_var < 45.0 or laplacian_var > 550.0:
-                    route_to_restorer = True
-                    route_reason = "WEATHER_HAZARD"
-            else:
-                # Day Mode
-                if white_clipping > 0.08:
-                    route_to_restorer = True
-                    route_reason = "DAY_GLARE"
-                elif laplacian_var < 160.0 or laplacian_var > 1150.0:
-                    route_to_restorer = True
-                    route_reason = "WEATHER_HAZARD"
+            # 3. Illumination & Gating Switching Logic
+            route_to_restorer, route_reason = gating.check_gating(mean_brightness, laplacian_var, white_clipping)
             
             # 4. Image Processing (PyTorch tensor preparation)
             # Normalizing BGR image shape (H, W, C) to Tensor (C, H, W) scaled between [0.0, 1.0]

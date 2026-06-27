@@ -16,6 +16,10 @@ __pycache__/
 assets/*.pt
 assets/**/*.pt
 
+# Test images (user data, not code)
+assets/test_images/
+
 # OS files
 .DS_Store
 Thumbs.db
+*:Zone.Identifier

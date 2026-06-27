@@ -10,6 +10,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', ['launch/perception_pipeline.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -26,6 +27,7 @@ setup(
         'console_scripts': [
         'perception_offline = yolo_perception_pkg.perception_offline_node:main',
         'perception_carla = yolo_perception_pkg.perception_carla_node:main',
+        'yolo_detector = yolo_perception_pkg.yolo_detector_node:main',
         ],
     },
 )
