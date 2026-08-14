@@ -19,7 +19,11 @@ assets/**/*.pt
 # Test images (user data, not code)
 assets/test_images/
 
+# Generated results
+results/
+
 # OS files
 .DS_Store
 Thumbs.db
 *:Zone.Identifier
+

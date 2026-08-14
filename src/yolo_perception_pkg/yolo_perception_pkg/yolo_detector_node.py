@@ -1,112 +1,151 @@
 #!/usr/bin/env python3
+"""
+TH OWL — YOLO Object Detector Node
+====================================
+Subscribes to the cleaned/restored image stream from the perception node,
+runs YOLOv8/YOLOv10 inference, and publishes bounding box detections as
+vision_msgs/Detection2DArray.
+
+Subscribes:   /camera/front/cleaned   (sensor_msgs/Image)
+Publishes:    /yolo/detections         (vision_msgs/Detection2DArray)
+
+Authors:  TH OWL Project 8
+Node:     yolo_detector_node
+"""
 
 import os
-import time
-import numpy as np
+
 import cv2
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
-
-# Import vision_msgs for publishing bounding boxes
 from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
 
 try:
     from ultralytics import YOLO
 except ImportError:
-    raise ImportError("The 'ultralytics' library is required to run the yolo_detector_node. Please install it using: pip install ultralytics")
+    raise ImportError(
+        "The 'ultralytics' library is required to run yolo_detector_node.\n"
+        "Install it with:  pip install ultralytics"
+    )
+
+# Portable default — expands to current user's home, no hardcoded username
+_DEFAULT_YOLO_PATH = os.path.join(
+    os.path.expanduser('~'), 'ros2_ws', 'assets', 'pt_files', 'yolo.pt')
+
 
 class YoloDetectorNode(Node):
-    def __init__(self):
+
+    def __init__(self) -> None:
         super().__init__('yolo_detector_node')
 
-        # Declare parameters
-        self.declare_parameter('yolo_weights_path', '/home/dell_ubuntu/ros2_ws/assets/pt_files/yolo.pt')
+        # ── ROS2 Parameters ────────────────────────────────────────────────────────
+        self.declare_parameter('yolo_weights_path',    _DEFAULT_YOLO_PATH)
         self.declare_parameter('confidence_threshold', 0.5)
 
-        # Get parameter values
-        self.yolo_weights_path = self.get_parameter('yolo_weights_path').get_parameter_value().string_value
-        self.confidence_threshold = self.get_parameter('confidence_threshold').get_parameter_value().double_value
+        self.yolo_weights_path   = self.get_parameter(
+            'yolo_weights_path').get_parameter_value().string_value
+        self.confidence_threshold = self.get_parameter(
+            'confidence_threshold').get_parameter_value().double_value
 
+        # ── YOLO Model Initialization ───────────────────────────────────────────────
         self.bridge = CvBridge()
-        self.model = None
+        self.model  = None
+        self._load_yolo_model()
 
-        self.model_path = self.yolo_weights_path
-
-        # Try to pre-load the model to save startup latency
-        try:
-            self.model = YOLO(self.model_path)
-            self.get_logger().info(f"Successfully initialized YOLO model with source: {self.model_path}")
-        except Exception as e:
-            self.get_logger().error(f"Failed to initialize YOLO model on startup: {str(e)}. Will attempt initialization on first frame.")
-
-        # Create Subscriber for the cleaned/restored frames
+        # ── Subscriptions ──────────────────────────────────────────────────────────
         self.subscription = self.create_subscription(
             Image,
             '/camera/front/cleaned',
             self.image_callback,
-            10
+            10,
         )
-        self.get_logger().info("Subscribed to topic: '/camera/front/cleaned'")
+        self.get_logger().info("Subscribed to: '/camera/front/cleaned'")
 
-        # Create Publisher for bounding box detections
+        # ── Publishers ─────────────────────────────────────────────────────────────
         self.publisher = self.create_publisher(
-            Detection2DArray,
-            '/yolo/detections',
-            10
-        )
-        self.get_logger().info("Configured publisher for topic: '/yolo/detections'")
-        self.get_logger().info("YOLO Detector node initialized successfully.")
+            Detection2DArray, '/yolo/detections', 10)
+        self.get_logger().info(
+            "Publisher ready: '/yolo/detections' | "
+            f"Confidence threshold: {self.confidence_threshold}")
+        self.get_logger().info('YoloDetectorNode initialized successfully.')
 
-    def image_callback(self, msg):
+    # ─────────────────────────────────────────────────────────────────────────────
+    #  Model Loading
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    def _load_yolo_model(self) -> None:
+        """
+        Attempt to pre-load the YOLO model at startup.
+        Logs a FATAL message and keeps self.model = None if the file is missing
+        or the load fails. The model will not be lazily retried — a missing file
+        at startup indicates a configuration error that should be fixed.
+        """
+        path = self.yolo_weights_path
+        if not os.path.isfile(path):
+            self.get_logger().fatal(
+                f'[YOLO] Weight file not found: {path}\n'
+                f'  → Provide the file or override the "yolo_weights_path" parameter.\n'
+                f'  → Inference calls will be skipped until the model is available.')
+            return
+        try:
+            self.model = YOLO(path)
+            self.get_logger().info(f'[YOLO] Model loaded from: {path}')
+        except Exception as exc:
+            self.get_logger().fatal(f'[YOLO] Model load failed — {exc}')
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    #  Image Callback
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    def image_callback(self, msg: Image) -> None:
         start_time = self.get_clock().now()
 
+        # Skip inference if the model is unavailable (missing weights)
+        if self.model is None:
+            self.get_logger().warn(
+                '[YOLO] Model not loaded — skipping inference for this frame.',
+                throttle_duration_sec=5.0,
+            )
+            return
+
         try:
-            # 1. Convert ROS2 Image message to BGR OpenCV image
+            # ── Step 1: Decode ROS2 Image ──────────────────────────────────────────
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
-            # 2. Lazily initialize the model if it wasn't loaded during startup
-            if self.model is None:
-                self.model = YOLO(self.model_path)
+            # ── Step 2: YOLO Inference ─────────────────────────────────────────────
+            results = self.model.predict(
+                cv_image, conf=self.confidence_threshold, verbose=False)
 
-            # 3. Perform inference
-            results = self.model.predict(cv_image, conf=self.confidence_threshold, verbose=False)
-
-            # 4. Construct Detection2DArray message
-            detection_array = Detection2DArray()
-            
-            # CRITICAL: Copy the original incoming msg.header directly into the outbound detections header
-            # to preserve simulator time synchronization for the downstream components
-            detection_array.header = msg.header
+            # ── Step 3: Build Detection2DArray ────────────────────────────────────
+            detection_array        = Detection2DArray()
+            detection_array.header = msg.header   # preserve simulator timestamp
 
             for result in results:
-                boxes = result.boxes
-                for box in boxes:
-                    # Get box coordinates [xmin, ymin, xmax, ymax]
-                    xyxy = box.xyxy[0].cpu().numpy()
+                for box in result.boxes:
+                    xyxy             = box.xyxy[0].cpu().numpy()
                     xmin, ymin, xmax, ymax = map(float, xyxy)
+                    cls_id           = int(box.cls[0].item())
+                    conf             = float(box.conf[0].item())
 
-                    # Get class and confidence
-                    cls_id = int(box.cls[0].item())
-                    conf = float(box.conf[0].item())
-
-                    # Construct Detection2D message
-                    detection = Detection2D()
+                    detection        = Detection2D()
                     detection.header = msg.header
 
-                    # Construct hypothesis compatibility logic (handles multiple vision_msgs versions)
+                    # vision_msgs version-compatibility shim
                     hypothesis = ObjectHypothesisWithPose()
                     if hasattr(hypothesis, 'hypothesis'):
-                        # Modern vision_msgs
-                        if hasattr(hypothesis.hypothesis, 'class_id'):
-                            hypothesis.hypothesis.class_id = str(cls_id)
+                        # Modern vision_msgs (≥ 4.x)
+                        h_inner = hypothesis.hypothesis
+                        if hasattr(h_inner, 'class_id'):
+                            h_inner.class_id = str(cls_id)
                         else:
-                            hypothesis.hypothesis.id = str(cls_id)
-                        hypothesis.hypothesis.score = conf
+                            h_inner.id = str(cls_id)
+                        h_inner.score = conf
                     else:
-                        # Legacy vision_msgs
+                        # Legacy vision_msgs (< 4.x)
                         if hasattr(hypothesis, 'class_id'):
                             hypothesis.class_id = str(cls_id)
                         else:
@@ -115,37 +154,46 @@ class YoloDetectorNode(Node):
 
                     detection.results.append(hypothesis)
 
-                    # Setup bounding box dimensions and center coordinates
                     detection.bbox.center.position.x = (xmin + xmax) / 2.0
                     detection.bbox.center.position.y = (ymin + ymax) / 2.0
-                    detection.bbox.size_x = xmax - xmin
-                    detection.bbox.size_y = ymax - ymin
+                    detection.bbox.size_x             = xmax - xmin
+                    detection.bbox.size_y             = ymax - ymin
 
                     detection_array.detections.append(detection)
 
-            # 5. Broadcast the detections to downstream path planners / trackers
+            # ── Step 4: Publish Detections ─────────────────────────────────────────
             self.publisher.publish(detection_array)
 
-            # Compute execution latency
-            end_time = self.get_clock().now()
+            end_time   = self.get_clock().now()
             latency_ms = (end_time - start_time).nanoseconds / 1e6
 
             self.get_logger().info(
-                f"YOLO Inference Latency: {latency_ms:.2f} ms | Detections: {len(detection_array.detections)}"
+                f'YOLO Latency: {latency_ms:.2f} ms | '
+                f'Detections: {len(detection_array.detections)}'
             )
 
-        except Exception as e:
-            self.get_logger().error(f"YOLO detector processing failed: {str(e)}")
+        except Exception as exc:
+            self.get_logger().error(f'yolo_detector image_callback failed: {exc}')
 
-def main(args=None):
+
+# -------------------------------------------------------------------------------------
+#  Entry Point
+# -------------------------------------------------------------------------------------
+
+def main(args=None) -> None:
     rclpy.init(args=args)
     node = YoloDetectorNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("Shutting down YOLO detector node via KeyboardInterrupt.")
+        node.get_logger().info(
+            'Shutting down YoloDetectorNode via KeyboardInterrupt.')
     finally:
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
 
 if __name__ == '__main__':
     main()

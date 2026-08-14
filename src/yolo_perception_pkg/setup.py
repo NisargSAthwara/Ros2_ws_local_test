@@ -28,6 +28,7 @@ setup(
         'perception_offline = yolo_perception_pkg.perception_offline_node:main',
         'perception_carla = yolo_perception_pkg.perception_carla_node:main',
         'yolo_detector = yolo_perception_pkg.yolo_detector_node:main',
+        'web_hud_streamer = yolo_perception_pkg.web_hud_streamer:main',
         ],
     },
 )

@@ -156,14 +156,12 @@ def load_restorer(weights_path: str, device: torch.device) -> LightweightRestore
 
 def load_classifier(weights_path: str, device: torch.device) -> nn.Module:
     """
-    Initialize and load the ResNet50 Weather Classifier with pre-trained weights.
-    Handles multiple checkpoint formats:
-      - 'fc.1.weight' → Sequential(Dropout, Linear) final layer
-      - 'fc.weight'   → Standard Linear final layer
+    Initialize and load the Weather Classifier with pre-trained weights.
+    Handles multiple checkpoint formats and architectures:
+      - ResNet50 ('fc.1.weight' or 'fc.weight')
+      - EfficientNet ('classifier.1.weight')
       - 'model_state' wrapper dictionaries
-    Preserved from local perception_carla_node.py / perception_offline_node.py.
     """
-    classifier = models.resnet50()
     checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
 
     if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
@@ -171,22 +169,49 @@ def load_classifier(weights_path: str, device: torch.device) -> nn.Module:
     else:
         state_dict = checkpoint
 
-    # Adapt the final classification head based on checkpoint structure
-    if 'fc.1.weight' in state_dict:
-        num_classes = state_dict['fc.1.weight'].size(0)
-        classifier.fc = nn.Sequential(
-            nn.Dropout(p=0.2),
-            nn.Linear(2048, num_classes)
-        )
-    elif 'fc.weight' in state_dict:
-        num_classes = state_dict['fc.weight'].size(0)
-        if num_classes != 1000:
-            classifier.fc = nn.Linear(classifier.fc.in_features, num_classes)
+    global WEATHER_CLASS_LABELS
+    if isinstance(checkpoint, dict) and 'classes' in checkpoint:
+        WEATHER_CLASS_LABELS = [c.capitalize() for c in checkpoint['classes']]
+        print(f"[INIT] Overriding classes from checkpoint: {WEATHER_CLASS_LABELS}")
 
-    classifier.load_state_dict(state_dict)
+    keys = list(state_dict.keys())
+    is_efficientnet = any('classifier.1' in k for k in keys) or 'efficientnet' in weights_path.lower()
+
+    if is_efficientnet:
+        classifier = models.efficientnet_v2_m()
+        if 'classifier.1.weight' in state_dict:
+            num_classes = state_dict['classifier.1.weight'].size(0)
+            if num_classes != 1000:
+                classifier.classifier[1] = nn.Linear(classifier.classifier[1].in_features, num_classes)
+        classifier_name = "efficientnet_v2_m"
+    else:
+        classifier = models.resnet50()
+        # Adapt the final classification head based on checkpoint structure
+        if 'fc.1.weight' in state_dict:
+            num_classes = state_dict['fc.1.weight'].size(0)
+            classifier.fc = nn.Sequential(
+                nn.Dropout(p=0.2),
+                nn.Linear(2048, num_classes)
+            )
+        elif 'fc.weight' in state_dict:
+            num_classes = state_dict['fc.weight'].size(0)
+            if num_classes != 1000:
+                classifier.fc = nn.Linear(classifier.fc.in_features, num_classes)
+        classifier_name = "resnet50"
+
+    # Filter state dict for shape mismatch
+    model_state_dict = classifier.state_dict()
+    filtered_state = {}
+    for k, v in state_dict.items():
+        if k in model_state_dict and v.shape == model_state_dict[k].shape:
+            filtered_state[k] = v
+        else:
+            print(f"[INIT] Skipping {k} due to shape mismatch or missing key.")
+    
+    classifier.load_state_dict(filtered_state, strict=False)
     classifier = classifier.to(device)
     classifier.eval()
-    print(f"[INIT] ResNet50 Weather Classifier loaded from: {weights_path}")
+    print(f"[INIT] {classifier_name} Weather Classifier loaded from: {weights_path}")
     return classifier
 
 
@@ -342,8 +367,18 @@ def classify_weather(
         confidence (float):      Softmax confidence of the predicted class (0.0–1.0)
         confidence_profile (list[float]): Full softmax probability vector
     """
+    import torch.nn.functional as F_nn
+    
+    # Preprocess for Torchvision Classifier (BGR -> RGB, Resize 224x224, Normalize)
+    rgb_tensor = frame_tensor[:, [2, 1, 0], :, :]
+    resized_tensor = F_nn.interpolate(rgb_tensor, size=(224, 224), mode='bilinear', align_corners=False)
+    
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    normalized_tensor = (resized_tensor - mean) / std
+
     with torch.no_grad():
-        logits = classifier(frame_tensor)
+        logits = classifier(normalized_tensor)
         probabilities = torch.softmax(logits, dim=1)
         confidence, predicted_index = torch.max(probabilities, dim=1)
         predicted_index = int(predicted_index.item())
@@ -366,9 +401,11 @@ def apply_gating_logic(weather_label: str) -> tuple:
         route_to_restorer (bool): True if frame should pass through the restorer.
         route_mode (str):         'BYPASS' or 'RESTORED' for HUD display.
     """
-    adverse_conditions = {"Fog", "Mist", "Night", "Rain", "Snowy"}
+    # Match all possible adverse classes from different checkpoint versions
+    adverse_conditions = {"Fog", "Mist", "Night", "Rain", "Snowy", "Rainy"}
 
-    if weather_label in adverse_conditions:
+    # Also make case-insensitive just in case
+    if weather_label.capitalize() in adverse_conditions:
         return True, "RESTORED"
     else:
         return False, "BYPASS"
@@ -624,25 +661,7 @@ def render_hud_overlay(
     draw_text(f"  Detections: {num_detections}")
     draw_separator()
 
-    # Raw Analytical Metrics
-    draw_text("RAW METRICS", HUD_HEADER_COLOR, 0.48, bold=True)
-    draw_text(f"  Laplacian Var: {laplacian_var:.1f}")
-    draw_text(f"  Brightness: {mean_brightness:.1f}")
-    draw_text(f"  White Clip: {white_clip_ratio * 100.0:.2f}%")
-    draw_separator()
 
-    # Confidence Profile (all classes)
-    draw_text("CONFIDENCE PROFILE", HUD_HEADER_COLOR, 0.48, bold=True)
-    for i, label in enumerate(WEATHER_CLASS_LABELS):
-        if i < len(confidence_profile):
-            prob = confidence_profile[i] * 100.0
-            # Mini bar for each class
-            bar_fill = int((panel_width - 120) * min(confidence_profile[i], 1.0))
-            cv2.rectangle(frame,
-                          (x_margin + 110, y_cursor - 12),
-                          (x_margin + 110 + max(bar_fill, 0), y_cursor - 3),
-                          HUD_HEADER_COLOR, -1)
-            draw_text(f"  {label:6s}: {prob:5.1f}%")
 
     return frame
 
@@ -728,6 +747,8 @@ def main():
     frame_index = 0
     window_name = "TH OWL — Adverse Weather Perception Pipeline"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1280, 720)
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
 
     print("=" * 72)
     print("  Pipeline Active — Press 'q' or ESC to exit")
